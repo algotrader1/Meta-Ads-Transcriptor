@@ -1,0 +1,30 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Data folders (contain downloaded/generated files)
+downloads/
+audio/
+transcripts/
+results/
+
+# Debug files
+debug_screenshot.png
+
+# macOS
+.DS_Store
+
+# IDE
+.claude/
+.vscode/
+.idea/
+
+# Old/deprecated scripts
+ads_analyzer.py
+transcript_ads.py
+urls_example.txt

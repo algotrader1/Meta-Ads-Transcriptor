@@ -1,0 +1,11 @@
+# Dépendances Python pour Facebook Ads Transcript Tool
+
+# Téléchargement de vidéos
+yt-dlp>=2024.1.0
+
+# Transcription audio (Whisper d'OpenAI - open source)
+openai-whisper>=20231117
+
+# Dépendances optionnelles pour scraping avancé
+# playwright>=1.40.0  # Pour naviguer automatiquement dans Ads Library
+# beautifulsoup4>=4.12.0
