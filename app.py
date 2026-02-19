@@ -440,7 +440,7 @@ HTML_TEMPLATE = '''
                     <div class="input-group">
                         <label>URL Facebook ou Instagram</label>
                         <input type="text" id="pageUrl"
-                               placeholder="facebook.com/pagename ou instagram.com/username"
+                               placeholder="URL de pub, page Facebook ou Instagram"
                                required>
                     </div>
                     <div class="input-group" style="width: 140px; flex: none;">
@@ -650,24 +650,20 @@ def analyze():
 
     page_id = None
     page_name_to_search = None
+    direct_ad_ids = []
 
+    # Extract all ad IDs from the input (support multiple URLs/IDs separated by newlines, commas, spaces)
+    ad_id_matches = re.findall(r'(?:/ads/library/\?id=|^)(\d{8,})', page_url)
+    if '/ads/library/' in page_url and ad_id_matches:
+        direct_ad_ids = list(set(ad_id_matches))
     # Check for view_all_page_id parameter
-    match = re.search(r'view_all_page_id=(\d+)', page_url)
-    if match:
-        page_id = match.group(1)
+    elif re.search(r'view_all_page_id=(\d+)', page_url):
+        page_id = re.search(r'view_all_page_id=(\d+)', page_url).group(1)
     # Check for profile.php?id=XXXXX format
     elif 'profile.php' in page_url:
         profile_match = re.search(r'[?&]id=(\d+)', page_url)
         if profile_match:
             page_id = profile_match.group(1)
-    # Check for ads library ?id= format
-    elif '/ads/library/' in page_url and '?id=' in page_url:
-        ad_match = re.search(r'\?id=(\d+)', page_url)
-        if ad_match:
-            # This is a single ad URL, we need to find its page
-            page_name_to_search = None
-            page_id = None
-            # Will need special handling
     elif page_url.isdigit():
         page_id = page_url
     elif 'facebook.com/' in page_url:
@@ -681,21 +677,24 @@ def analyze():
     elif page_url and not page_url.startswith('http'):
         page_name_to_search = page_url
 
-    if not page_id and not page_name_to_search:
-        return jsonify({"error": "URL invalide. Entrez une URL Facebook ou Instagram."})
+    if not page_id and not page_name_to_search and not direct_ad_ids:
+        return jsonify({"error": "URL invalide. Entrez une URL Facebook, Instagram, ou une URL de pub."})
 
     progress_data = {
         "status": "running",
         "current_step": 1,
         "total_steps": 5,
-        "step_name": "Recherche de la page",
-        "detail": "Connexion...",
+        "step_name": "Préparation",
+        "detail": "Démarrage...",
         "progress": 0,
         "total": 0,
         "result": None
     }
 
-    thread = threading.Thread(target=run_analysis, args=(page_id, language, page_name_to_search))
+    if direct_ad_ids:
+        thread = threading.Thread(target=run_direct_ads_analysis, args=(direct_ad_ids, language))
+    else:
+        thread = threading.Thread(target=run_analysis, args=(page_id, language, page_name_to_search))
     thread.start()
 
     return jsonify({"success": True})
@@ -721,6 +720,74 @@ def update_progress(step, name, detail="", progress=0, total=0):
     progress_data["detail"] = detail
     progress_data["progress"] = progress
     progress_data["total"] = total
+
+
+def run_direct_ads_analysis(ad_ids: list, language: str):
+    """When user provides a single ad URL, find the advertiser's page and analyze ALL their ads."""
+    global progress_data
+
+    try:
+        setup()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        ad_url = f"https://www.facebook.com/ads/library/?id={ad_ids[0]}"
+
+        # Step 1: Open ad page and extract the advertiser's page_id
+        update_progress(1, "Scan de la pub", "Recherche de l'annonceur...")
+        page_id = loop.run_until_complete(extract_page_id_from_ad(ad_url))
+
+        if not page_id:
+            raise Exception("Impossible de trouver la page de l'annonceur depuis cette pub.")
+
+        # Now use the existing full-page analysis flow
+        update_progress(1, "Scan des publicités", f"Page trouvée (ID: {page_id})")
+        result = loop.run_until_complete(analyze_page(page_id, language))
+        loop.close()
+
+        progress_data["status"] = "complete"
+        progress_data["result"] = result
+
+    except Exception as e:
+        progress_data["status"] = "error"
+        progress_data["detail"] = str(e)
+
+
+async def extract_page_id_from_ad(ad_url: str) -> str:
+    """Open a single ad page in Playwright and extract the advertiser's page_id."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--disable-blink-features=AutomationControlled']
+        )
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+        await page.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined})')
+
+        try:
+            await page.goto(ad_url, wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(5)
+
+            html = await page.content()
+
+            # Best: deeplink_ad_archive contains the actual advertiser's page_id
+            match = re.search(r'deeplink_ad_archive.*?"page_id"[:\s]*"?(\d+)"?', html, re.DOTALL)
+            if match:
+                return match.group(1)
+
+            # Fallback: view_all_page_id in a link
+            match2 = re.search(r'view_all_page_id=(\d+)', html)
+            if match2:
+                return match2.group(1)
+
+            return None
+        finally:
+            await browser.close()
 
 
 def run_analysis(page_id: str, language: str, page_name_to_search: str = None):
@@ -877,53 +944,166 @@ async def analyze_page(page_id: str, language: str):
         ad_text=d.get("ad_text", ""), cta_text=d.get("cta_text", ""), cta_link=d.get("cta_link", "")
     ) for d in ads_data]
 
-    update_progress(2, "Téléchargement", f"0/{len(ads)}", 0, len(ads))
+    # Step 2+3: Download videos via Playwright and transcribe
+    import urllib.request
+    import whisper
 
-    for i, ad in enumerate(ads):
-        update_progress(2, "Téléchargement", f"{i+1}/{len(ads)}", i+1, len(ads))
-        output_path = DOWNLOADS_DIR / f"ad_{ad.ad_id}.mp4"
-
-        if output_path.exists() and output_path.stat().st_size > 1000:
-            ad.video_path = output_path
+    # First, check which ads already have cached transcripts
+    ads_to_download = []
+    for ad in ads:
+        cache_file = TRANSCRIPTS_DIR / f"ad_{ad.ad_id}.txt"
+        if cache_file.exists():
+            cached = cache_file.read_text(encoding="utf-8")
+            if len(cached) > 50:
+                ad.transcript = cached
+            else:
+                cache_file.unlink()
+                ads_to_download.append(ad)
         else:
-            cmd = ["yt-dlp", "-f", "best[ext=mp4]/best", "-o", str(output_path),
-                   "--no-playlist", "--quiet", "--no-warnings", ad.url]
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=120)
-                if output_path.exists():
-                    ad.video_path = output_path
-            except:
-                pass
+            ads_to_download.append(ad)
 
-        if ad.video_path:
-            audio_path = AUDIO_DIR / f"ad_{ad.ad_id}.mp3"
-            if not audio_path.exists():
-                cmd = ["ffmpeg", "-i", str(ad.video_path), "-vn", "-acodec", "libmp3lame",
-                       "-q:a", "2", "-y", "-loglevel", "error", str(audio_path)]
+    cached_count = len(ads) - len(ads_to_download)
+    if cached_count:
+        update_progress(2, "Téléchargement", f"{cached_count} en cache, {len(ads_to_download)} à télécharger")
+
+    if ads_to_download:
+        # Open each ad page with Playwright to extract video URLs
+        update_progress(2, "Téléchargement", f"0/{len(ads_to_download)}", 0, len(ads_to_download))
+
+        async def download_ad_video(ad, browser_ctx):
+            """Open a single ad page and download its video."""
+            output_path = DOWNLOADS_DIR / f"ad_{ad.ad_id}.mp4"
+            if output_path.exists() and output_path.stat().st_size > 1000:
+                ad.video_path = output_path
+                return
+
+            pg = await browser_ctx.new_page()
+            video_network_urls = []
+            def on_resp(response):
+                u = response.url
+                ct = response.headers.get('content-type', '')
+                if ('video' in ct or '.mp4' in u) and 'fbcdn.net' in u:
+                    video_network_urls.append(u)
+            pg.on('response', on_resp)
+
+            try:
+                await pg.goto(ad.url, wait_until="networkidle", timeout=30000)
+                await asyncio.sleep(3)
+
+                # Try clicking play
                 try:
-                    subprocess.run(cmd, capture_output=True, timeout=60)
+                    vid = pg.locator('video').first
+                    if await vid.is_visible(timeout=2000):
+                        await vid.click()
+                        await asyncio.sleep(2)
                 except:
                     pass
-            if audio_path.exists() and audio_path.stat().st_size > 1000:
-                ad.audio_path = audio_path
 
-    import whisper
-    ads_with_audio = [a for a in ads if a.audio_path]
-    update_progress(3, "Transcription", f"0/{len(ads_with_audio)}", 0, len(ads_with_audio))
+                # Get video URLs from DOM
+                video_srcs = await pg.evaluate('''() => {
+                    const videos = document.querySelectorAll("video");
+                    const sources = [];
+                    for (const v of videos) {
+                        if (v.src && v.src.startsWith("http")) sources.push(v.src);
+                        v.querySelectorAll("source").forEach(s => {
+                            if (s.src && s.src.startsWith("http")) sources.push(s.src);
+                        });
+                    }
+                    return [...new Set(sources)];
+                }''')
 
-    if ads_with_audio:
-        model = whisper.load_model("base")
-        for i, ad in enumerate(ads_with_audio):
-            update_progress(3, "Transcription", f"{i+1}/{len(ads_with_audio)}", i+1, len(ads_with_audio))
-            cache_file = TRANSCRIPTS_DIR / f"ad_{ad.ad_id}.txt"
-            if cache_file.exists():
-                ad.transcript = cache_file.read_text(encoding="utf-8")
-            else:
+                all_urls = list(dict.fromkeys(video_srcs + video_network_urls))
+
+                # Download the best video (try each URL, pick longest)
+                best_path = None
+                best_duration = 0
+                for idx, vurl in enumerate(all_urls[:5]):
+                    tmp_path = DOWNLOADS_DIR / f"ad_{ad.ad_id}_tmp{idx}.mp4"
+                    try:
+                        req = urllib.request.Request(vurl, headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            tmp_path.write_bytes(resp.read())
+                        if tmp_path.exists() and tmp_path.stat().st_size > 1000:
+                            probe = subprocess.run(
+                                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                 "-of", "default=noprint_wrappers=1:nokey=1", str(tmp_path)],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            dur = float(probe.stdout.strip()) if probe.stdout.strip() else 0
+                            if dur > best_duration:
+                                if best_path:
+                                    best_path.unlink(missing_ok=True)
+                                best_duration = dur
+                                best_path = tmp_path
+                            else:
+                                tmp_path.unlink(missing_ok=True)
+                        else:
+                            tmp_path.unlink(missing_ok=True)
+                    except:
+                        tmp_path.unlink(missing_ok=True)
+
+                if best_path and best_duration >= 5:
+                    best_path.rename(output_path)
+                    ad.video_path = output_path
+                elif best_path:
+                    best_path.unlink(missing_ok=True)
+            except:
+                pass
+            finally:
+                await pg.close()
+
+        # Run downloads with a shared browser
+        async def download_all_videos():
+            from playwright.async_api import async_playwright
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(
+                    headless=True,
+                    args=['--disable-blink-features=AutomationControlled']
+                )
+                context = await browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                await context.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined})')
+
+                for i, ad in enumerate(ads_to_download):
+                    update_progress(2, "Téléchargement", f"{i+1}/{len(ads_to_download)} ({ad.ad_id[:8]}...)", i+1, len(ads_to_download))
+                    await download_ad_video(ad, context)
+
+                await browser.close()
+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(download_all_videos())
+
+        # Extract audio from downloaded videos
+        for ad in ads_to_download:
+            if ad.video_path:
+                audio_path = AUDIO_DIR / f"ad_{ad.ad_id}.mp3"
+                if not audio_path.exists():
+                    cmd = ["ffmpeg", "-i", str(ad.video_path), "-vn", "-acodec", "libmp3lame",
+                           "-q:a", "2", "-y", "-loglevel", "error", str(audio_path)]
+                    try:
+                        subprocess.run(cmd, capture_output=True, timeout=60)
+                    except:
+                        pass
+                if audio_path.exists() and audio_path.stat().st_size > 1000:
+                    ad.audio_path = audio_path
+
+        # Transcribe
+        ads_with_audio = [a for a in ads_to_download if a.audio_path]
+        if ads_with_audio:
+            update_progress(3, "Transcription", "Chargement du modèle...")
+            model = whisper.load_model("medium")
+            for i, ad in enumerate(ads_with_audio):
+                update_progress(3, "Transcription", f"{i+1}/{len(ads_with_audio)}", i+1, len(ads_with_audio))
+                cache_file = TRANSCRIPTS_DIR / f"ad_{ad.ad_id}.txt"
                 try:
                     result = model.transcribe(str(ad.audio_path), language=language)
                     ad.transcript = result["text"].strip()
-                    if ad.transcript:
+                    if ad.transcript and len(ad.transcript) > 10:
                         cache_file.write_text(ad.transcript, encoding="utf-8")
+                    elif len(ad.transcript) <= 10:
+                        ad.transcript = ""
                 except:
                     pass
 
@@ -1113,7 +1293,7 @@ def generate_pdf(ads, page_info: PageInfo, variant_counts):
 
 if __name__ == '__main__':
     setup()
-    print("\n  Ads Analyzer → http://localhost:5001\n")
+    print("\n  Ads Analyzer → http://localhost:5002\n")
     import webbrowser
-    webbrowser.open('http://localhost:5001')
-    app.run(debug=False, port=5001, host='127.0.0.1')
+    webbrowser.open('http://localhost:5002')
+    app.run(debug=False, port=5002, host='127.0.0.1')
